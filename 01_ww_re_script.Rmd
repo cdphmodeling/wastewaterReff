@@ -1,0 +1,893 @@
+---
+title: "Calculate Wastewater-Derived Effective Reproduction Numbers"
+output:
+  html_document: 
+    toc: true
+    toc_float: true
+    theme: cerulean
+---
+
+*Acronyms or terminology included in this script: 
+1. "WW" = Wastewater
+2. "WTPs" or "WWTPs" = Wastewater Treatment Plants (alternatively referred to as sewersheds)
+3. "CI" = Confidence Interval
+4. "EpiEstim" = instantaneous effective reproduction number estimates calculated using the methods of Cori et al. (2013)
+5. "Wallinga&Teunis" = cohort effective reproduction number estimates calculated using the methods of Wallinga and Teunis (2004)
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# Step 1: Load necessary packages
+```{r, include=FALSE}
+library(tidyverse)
+library(anomalize)
+library(splines)
+library(npreg)
+library(data.table)
+library(R0)
+library(Metrics)
+library(estimateR)
+library(EpiEstim)
+library(ggthemr)
+library(kableExtra)
+library(plotly)
+library(doParallel)
+library(foreach)
+library(rootSolve)
+library(forecast)
+library(colorspace)
+library(splitstackshape)
+library(Matrix) # Downstream estimation of the effective reproduction number does not run without later version of Matrix
+
+`%notin%` <- Negate(`%in%`)
+```
+
+# Step 2: Load source files for general functions utilized in this script
+```{r, include = FALSE}
+source("00_ww_re_script_functions.R", local = knitr::knit_global()) # General Functions
+source( "00_gaussian_process_functions.R", local = knitr::knit_global()) # Functions for Step 8 (Calculating county-level effective reproduction number confidence intervals via Gaussian process)
+```
+#*Note: Steps 3-10 detail the estimation pipeline for county-aggregated, sewershed-restricted wastewater- and case-based effective reproduction numbers. 
+
+# Step 3: Import WW data for counties of interest. Authors have modified the code to enable data import from the California Health and Human Services Open Data Portals (a publicly available source). 
+```{r}
+ww_df <- read_in_ww_data(c('Yolo','Stanislaus','Sacramento','Santa Clara','San Francisco')) 
+```
+
+# Step 4: Apply smoothing spline to WW data
+```{r}
+ww_df_expanded <- ww_df %>% group_by(data_source_short, pcr_gene_target, wwtp_name) %>% 
+  do(ww_data_with_smoothed_concentrations(., no_knots_vector = c(7), normalization_var = "raw_concentration"))
+```
+
+# Step 5: Further process spline-smoothed wastewater data
+
+## 5.1: Replace all spline values equal to zero with the level of detection/2
+```{r}
+spline_cols <- c("fit_ocv_7day_knots")
+
+# 250 was selected as a universal level of detection for included sites based on internal standards at the time of analysis/writing. This value can and should be modified based on the user's specific needs and data. 
+ww_df_expanded <- ww_df_expanded %>% mutate(across(all_of(spline_cols), function(value) ifelse(value == 0, 250, value)))
+```
+
+## 5.2 Root transform spline-smoothed wastewater (rationale explained within manuscript text)
+```{r}
+ww_df_expanded <- ww_df_expanded %>% group_by(data_source_short, pcr_gene_target, County_address, wwtp_name) %>% mutate(root_transform = sqrt(fit_ocv_7day_knots))
+```
+
+# Step 6: Estimate sewershed-level effective reproduction numbers 
+
+## 6.1: Define key distribution parameters used in sewershed-level, wastewater-based effective reproduction number estimation pipeline. 
+```{r}
+# Infection to shedding distribution; necessary for deconvolution step in estimation of wastewater-based effective reproduction numbers (refer to Table 2 in manuscript for further detail)
+sars_cov_2_distribution_infection_to_shedding <- define_infection_to_shedding(5, 0.5)
+
+# While the below variables refer to serial interval, the values input correspond to the generation time (refer to Table 2 in manuscript for further detail). Serial interval language is solely used below due to the structure of estimateR package functions (namely, input variable naming within the 'get_block_bootstrapped_estimate' function). estimateR is utilized to calculate instantaneous effective reproduction numbers.
+sars_cov_2_mean_serial_interval_days <- 6.84
+sars_cov_2_std_serial_interval_days <- 4.48
+
+# Creating a generation time object using the 'generation.time' function from the R0 package is necessary to calculate cohort effective reproduction numbers. 
+mGT2 <- R0::generation.time("gamma", c(sars_cov_2_mean_serial_interval_days, sars_cov_2_std_serial_interval_days)) 
+```
+
+## 6.2: Calculate sewershed-level, wastewater-based effective reproduction numbers 
+```{r}
+# Define which data frame columns should be utilized to estimate effective reproduction numbers (can be a vector of multiple inputs - for example, if the user would like to calculate effective reproduction numbers using multiple gene targets)  
+ww_input_cols <- c("root_transform") #'root_transform' corresponds to root-transformed, spline-smoothed wastewater concentrations
+
+# Restrict estimation to relevant period of analysis
+ww_data_analysis_period <- ww_df_expanded %>% filter(sample_date >= "2022-04-01" & sample_date <= "2023-05-30")
+
+# Run effective reproduction number estimation on all WTPs
+r_effective_initial_ww=data.frame(sample_date = as.Date(character()),
+                                  wwtp_name = character(),
+                                  County_address = character(),
+                                  Re_model = character(), #Cohort or instantaneous
+                                  input = character(), # Each user-defined component of 'ww_input_cols'
+                                  Re_estimate = numeric(),
+                                  deconvolved_incidence = numeric(),
+                                  CI_down_Re_estimate = numeric(), # CI = confidence interval
+                                  CI_up_Re_estimate = numeric(),
+                                  CI_down_deconvolved_incidence = numeric(), 
+                                  CI_up_deconvolved_incidence = numeric()) 
+
+# Execution of effective reproduction number estimation (slow rate of calculation; approximately 1 hour to complete)
+
+for(w in unique(ww_data_analysis_period$wwtp_name)){
+  tryCatch({
+    WWS_data=ww_data_analysis_period %>% filter(wwtp_name==w)
+    WWS_results_temp=reff_all_input_cols(WWS_data, input_cols_as_vector = ww_input_cols)
+    r_effective_initial_ww<- r_effective_initial_ww %>% bind_rows(WWS_results_temp)
+  }, error=function(e){cat("ERROR - ", w, " : ", conditionMessage(e), "\n")})
+}
+
+# Parallelized execution of estimation (increases rate of calculation)
+
+# registerDoParallel(cores=7) 
+# tictoc::tic()
+# r_effective_initial_ww <-
+#   foreach(j = unique(ww_data_analysis_period$wwtp_name), .combine = 'rbind') %dopar% {
+#     WWS_data=ww_data_analysis_period %>% filter(wwtp_name==j) 
+#     WWS_results_temp=reff_all_input_cols(WWS_data, input_cols_as_vector = ww_input_cols)
+#     r_effective_initial_ww<- r_effective_initial_ww %>% bind_rows(WWS_results_temp)
+#     r_effective_initial_ww
+#   }
+# tictoc::toc()
+
+```
+
+# *Note: Sections 6.3 and 6.4 relate to calculation of effective reproduction numbers based on sewershed-restricted, case data. Sewershed-restricted case data used for the manuscript is internal to the California Department of Public Health (CDPH). Publicly available sewershed-restricted case counts published by CDPH contain several masked values (in alignment with de-identification guidelines) for certain counties of interest (e.g., Yolo). As such, analyses relating to sewershed-restricted case counts are not executed within this script; however, code is included if the user would like to conduct analyses on other sources of sewershed-restricted case data.  
+
+## 6.3: Define additional key distribution parameters used in sewershed-level, case-based effective reproduction number estimation pipeline. 
+```{r}
+# Incubation period (necessary for deconvolution step of estimateR calculation)
+# sars_cov_2_distribution_incubation <- define_incubation(3.1, 2.6)
+
+# Symptom onset to reporting delay distribution as a list object (necessary for deconvolution step of estimateR calculation); this distribution is derived from internal CDPH data
+# sars_cov_2_distribution_onset_to_reporting <- list(
+#     name = "lnorm",
+#     meanlog = 0.94,
+#     sdlog = 0.73)
+
+```
+
+## 6.4: Calculate sewershed-restricted, case-based effective reproduction numbers.
+```{r}
+# Import publicly available, sewershed-restricted case data for sewersheds of interest (contains masked* values; user should substitute with independent source of case data)
+# *Masked values: Please note that values less than 5 for confirmed cases are masked (shown as “Masked”) if the sewershed population size is 50,000 or fewer, in accordance with de-identification guidelines. Values less than 3 for cases are masked (shown as “Masked”) if the sewershed population size is between 50,001 and 250,000. For no confirmed cases reported, values are set as zero. Since effective reproduction numbers cannot be calculated with "Masked" values, "Masked" values are approximated as 2 (average of 0-4) if the sewershed population size is 50,000 or fewer, and as 2 (average of 0-2) if the sewershed population size is between 50,001 and 250,000. Any remaining "Masked" values for population sizes greater than 250,000 are approximated to 1
+
+# wwtp_of_interest <- unique(ww_df_expanded$wwtp_name)
+# cases_data_0 <- read_in_case_data(wwtp_of_interest)
+
+# Collect county-level population data
+# The below is not commented out, as it is necessary for downstream steps 
+counties_of_interest <- c('Yolo','Stanislaus','Sacramento','Santa Clara','San Francisco')
+county_pop = CA_county_populations(counties_of_interest) %>% rename(County_address = county, county_population = pop2020)
+
+# cases_data = cases_data_0 %>% left_join(county_pop %>% select(c(County_address, county_population)), by = c("County_address"))
+
+# Define which data frame columns should be utilized to estimate effective reproduction numbers 
+# case_input_col <- c("raw_cases")
+
+# Restrict estimation to relevant period of analysis
+# cases_data_analysis_period <- cases_data %>% filter(sample_date >= "2022-04-01" & sample_date <= "2023-05-30") 
+
+# Run effective reproduction number estimation on all WTPs
+# r_effective_initial_cases=data.frame(sample_date = as.Date(character()),
+#                                   wwtp_name = character(),
+#                                   County_address = character(),
+#                                   Re_model = character(), #Cohort or instantaneous
+#                                   input = character(), # Each user-defined component of 'ww_input_cols'
+#                                   Re_estimate = numeric(),
+#                                   deconvolved_incidence = numeric(),
+#                                   CI_down_Re_estimate = numeric(), # CI = confidence interval
+#                                   CI_up_Re_estimate = numeric(),
+#                                   CI_down_deconvolved_incidence = numeric(), 
+#                                   CI_up_deconvolved_incidence = numeric()) 
+
+
+# Execution of effective reproduction number estimation (slow rate of calculation; approximately 1 hour to complete)
+
+# for(w in unique(cases_data_analysis_period$wwtp_name)){
+#   tryCatch({
+#     CASES_data=cases_data_analysis_period %>% filter(wwtp_name==w)
+#     CASES_results_temp=reff_all_input_cols(CASES_data, input_cols_as_vector = case_input_col)
+#     r_effective_initial_cases<- r_effective_initial_cases %>% bind_rows(CASES_results_temp)
+#   }, error=function(e){cat("ERROR - ", w, " : ", conditionMessage(e), "\n")})
+# }
+
+# Parallelized execution of estimation (increases rate of calculation)
+# registerDoParallel(cores=7)
+# tictoc::tic()
+# r_effective_initial_cases <-
+#   foreach(j = unique(cases_data_analysis_period$wwtp_name), .combine = 'rbind') %dopar% {
+#     CASES_data=cases_data_analysis_period %>% filter(wwtp_name==j) 
+#     CASES_results_temp=reff_all_input_cols(CASES_data, input_cols_as_vector = case_input_col)
+#     r_effective_initial_cases<- r_effective_initial_cases %>% bind_rows(CASES_results_temp)
+#     r_effective_initial_cases}
+# tictoc::toc()
+```
+
+
+## 6.5: Final modifications to sewershed-level effective reproduction numbers
+```{r}
+# Merge data frames containing sewershed-level, wastewater- and case-based effective reproduction numbers
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+  r_effective_initial <- full_join(r_effective_initial_ww %>% ungroup(), r_effective_initial_cases)}else{
+    r_effective_initial <- r_effective_initial_ww %>% ungroup()
+  }
+
+# Remove 'NA' values from leading and tailing edges of estimateR effective reproduction numbers (leading 'NA' values: introduced due to data necessity prior to estimation of effective reproduction numbers; tailing 'NA' values: introduced due to deconvolution)
+r_effective_remove_leading_lagging <- r_effective_initial %>% group_by(Re_model, input, wwtp_name) %>% filter(!is.na(Re_estimate)) %>% arrange(sample_date) %>% ungroup() 
+
+# Remove first window of entries for cohort and instantaneous effective reproduction number estimates (unreliable entries - spikes up for cohort, would skew downstream county aggregation of effective reproduction numbers)
+r_effective <- r_effective_remove_leading_lagging %>% group_by(Re_model, input, wwtp_name) %>%
+  slice(8:n()) %>% 
+  ungroup()
+```
+
+# Step 7: County-aggregate sewershed-level effective reproduction numbers 
+```{r}
+# Join WTP-level data on populations served to 'r_effective' data frame (necessary)
+sewershed_populations <- ww_df %>% 
+  ungroup() %>% 
+  group_by(County_address, wwtp_name) %>% 
+  summarise(population = max(population_served)) 
+
+# For sewershed-restricted case data in Yolo county, aggregation is necessary for estimation of effective reproduction numbers (refer to manuscript for further detail). While the below step is included, analyses related to sewershed-restricted, case-based effective reproduction numbers are excluded in this repository (please refer to the "Note" under Section 6.4 above or to the README file)
+total_yolo_pop = sewershed_populations %>% 
+  filter(County_address == "Yolo") %>% 
+  summarise(totalpop = sum(population)) %>% pull(totalpop)
+
+r_effective <- left_join(r_effective, sewershed_populations) %>%
+  mutate(population = ifelse(wwtp_name == "Yolo_aggregated", total_yolo_pop, population))
+
+# Create county-level estimates of effective reproduction numbers for the entire time series
+county_r_effective_initial <- r_effective %>%
+  ungroup() %>% group_by(Re_model, input, County_address, sample_date) %>% 
+  summarise(Re_estimate = sum(Re_estimate*population, na.rm = T)/sum(population, na.rm = T))
+```
+
+# Step 8: Calculate county-level effective reproduction number confidence intervals via Gaussian process (based on interpolation of sewershed-level confidence intervals)
+
+Description: If a sewershed represents 54% of the county, you have to repeat the corresponding effective reproduction number confidence intervals that many times (54) for each date in a single data frame, and then interpolate across to arrive at county-level confidence intervals. 
+
+```{r, include = FALSE}
+# Now, create a data frame in which each sewershed's data (for each date) is repeated X times. X represents the coverage by the given sewershed of its corresponding county. 
+r_effective_quant_0A = r_effective %>% ungroup() %>%
+  left_join(county_pop, by = c("County_address")) %>%
+  group_by(wwtp_name) %>%
+  mutate(coverage = round(population/county_population * 100)) %>%
+  ungroup()
+
+r_effective_quant_0B = setDT(expandRows(r_effective_quant_0A, "coverage"))[,
+     coverage := sprintf("%s-%s-%s-%s%d", wwtp_name, as.character(sample_date), County_address, "s",1:.N) , wwtp_name][]
+
+r_effective_quant_0C = setDT(r_effective_quant_0B)[,
+     wwtp_name := sprintf("%s-%s%d", wwtp_name, "s",1:.N) , wwtp_name][]
+
+# Reframe the data frame to enable Gaussian process
+r_effective_quant_initial = r_effective_quant_0C %>% group_by(County_address, 
+                                                              wwtp_name, 
+                                                              Re_model, 
+                                                              input, 
+                                                              sample_date) %>% 
+  summarise(`0.025`= CI_down_Re_estimate, `0.975`= CI_up_Re_estimate, `0.5`= Re_estimate) %>% 
+  pivot_longer(cols = c(`0.025`, `0.975`, `0.5`), names_to = "quantile", values_to = "value") %>%
+  mutate(quantile=as.numeric(quantile)) %>% ungroup()
+
+r_effective_quant = r_effective_quant_initial %>% filter(quantile != 0.5)
+
+gaussian_ci <- data.frame(sample_date = rep(as.Date(NA), 200000), 
+                       County_address = rep(NA, 200000), 
+                       Re_model = rep(NA, 200000), 
+                       input = rep(NA, 200000),
+                       qint_lo = rep(NA, 200000), 
+                       qint_hi = rep(NA, 200000))
+
+# Loop Testing Parameters
+# new_date = "2023-04-01"
+# county = "Santa Clara"
+# model = "Wallinga&Teunis"
+# model_input = "root_transform"
+
+ind = 1
+for(d in 1:length(unique(r_effective_quant$sample_date))){
+  new_date <- unique(r_effective_quant$sample_date)[d]
+  temp2_pre <- r_effective_quant %>% filter(sample_date == new_date) 
+  temp2 <- temp2_pre %>% dplyr::select(-sample_date) 
+  for(county in unique(temp2$County_address)){ # Each county of interest
+    for(model in unique(temp2$Re_model)){ # Instantaneous or cohort
+      for(model_input in unique(temp2$input)){ # Cases or wastewater
+        temp = temp2 %>% filter(County_address == county, Re_model == model, input == model_input, !is.na(value)) %>% arrange(quantile) %>% dplyr::select(-County_address)
+        if(length(unique(temp$wwtp_name)) < 2){
+          if(length(unique(temp$wwtp_name)) == 1) {
+            gaussian_ci$sample_date[ind] = new_date
+            gaussian_ci$County_address[ind] = county
+            gaussian_ci$Re_model[ind] = model
+            gaussian_ci$input[ind] = model_input
+            gaussian_ci$qint_lo[ind] = min(temp$value) 
+            gaussian_ci$qint_hi[ind] = max(temp$value) 
+            ind = ind+1
+          }
+          next}
+        
+        fit.data <- split(temp, temp$wwtp_name)   
+        
+        fit.data1 <- list()
+        
+        for(i in 1:length(unique(temp$wwtp_name))){
+          fit.data1[[i]] =  list(x = fit.data[[i]]$value, q = fit.data[[i]]$quantile)
+        }
+        
+        gaussians <- map( fit.data1, ~ CI_to_guassian( .$x, .$q ))
+        gcomposite <- list( mean = map_dbl( gaussians, ~.$mean ), sd = map_dbl( gaussians, ~.$sd ))
+        qint = qinterp( c( 0.025, 0.975 ), gcomposite )
+        gaussian_ci$sample_date[ind] = new_date
+        gaussian_ci$County_address[ind] = county
+        gaussian_ci$Re_model[ind] = model
+        gaussian_ci$input[ind] = model_input
+        gaussian_ci$qint_lo[ind] = qint[1]
+        gaussian_ci$qint_hi[ind] = qint[2]
+        ind = ind+1
+      }
+    }
+  }
+}
+
+gaussian_ci_final = gaussian_ci %>% ungroup() %>% arrange(County_address, sample_date, Re_model, input) %>% drop_na() 
+
+gaussian_ci_final = gaussian_ci_final %>% ungroup() %>%
+  left_join(county_pop, by = "County_address") 
+
+county_r_effective_initial_with_ci = county_r_effective_initial %>% mutate(sample_date = as.Date(sample_date)) %>%
+  full_join(gaussian_ci_final %>% rename(CI_down_Re_estimate = qint_lo, 
+                                         CI_up_Re_estimate = qint_hi))
+
+```
+
+# Step 9: Import and integrate CALCAT Ensemble Re
+```{r}
+# Import historical CalCAT Ensemble time series for counties of interest; the CSV file below includes estimates for all constituent CalCAT models, not exclusively the ensemble (denoted as "m.rt" in the 'Re_model' column of the CSV). 2020-2023 CalCAT data is not currently publicly available. Please contact the corresponding author for data requests. To import more recent 2024-specific data, please use https://data.chhs.ca.gov/dataset/calcat
+
+CALCAT_data_restricted <- fread("data/CalCatEnsemble_timeseries.csv") %>% mutate(sample_date = as.Date(sample_date)) %>% left_join(county_pop, by = "County_address")
+
+# Merge CalCAT data with county-level effective reproduction numbers and confidence intervals for downstream comparative analyses
+county_r_effective <- county_r_effective_initial_with_ci %>% 
+  full_join(CALCAT_data_restricted) %>% rename(population = county_population) %>% 
+  dplyr::select(-c(fips, state, Abbreviation))
+```
+
+# Step 10: Store all models for the effective reproduction number into a single data frame (sewershed- and county-level, cohort and instantaneous, wastewater-based and case-based)
+```{r}
+# Modify data frames containing sewershed- and county-level effective reproduction number estimates in order to merge both into a single data frame
+r_effective_new = r_effective %>%
+  mutate(location_level = ("sewershed")) %>% 
+  rename(location = wwtp_name) %>% 
+  left_join(ww_df %>% group_by(location = wwtp_name) %>% summarise(label_name = unique(label_name)))
+
+county_r_effective_new = county_r_effective %>%
+  mutate(location_level = "county") %>% 
+  rename(location = County_address) %>% 
+  mutate(County_address = location) 
+
+all_re_df = county_r_effective_new %>% 
+  full_join(r_effective_new %>% dplyr::select(-c(deconvolved_incidence, CI_down_deconvolved_incidence, CI_up_deconvolved_incidence))) 
+
+
+# Restrict all models within the data frame to precise dates reported within manuscript
+all_re_df = all_re_df %>% 
+  filter(sample_date >= "2022-05-01" & sample_date <= "2023-04-30") %>%
+  mutate(input = ifelse(input == "CALCAT", "CalCAT", input),
+         Re_model = ifelse(Re_model == "m.rt", "CalCAT ensemble", Re_model)) 
+```
+
+#*Note: All remaining steps relate to creation of Tables + Figures within the manuscript. 
+
+```{r}
+# Create file paths to store generated figures + tables
+fig_path <- "figures/"
+table_path <- "tables/"
+```
+
+
+# Step 11 [TABLE 6] - Conduct cross-correlation analyses between wastewater- and case-based effective reproduction numbers
+
+## 11.1: Assess ranked, Pearson cross-correlation coefficients with a maximum lag value range of 20 days
+```{r}
+# Specify aesthetics of downstream plots using the 'ggthemr' package
+theme_choice = 'pale' # See https://github.com/Mikata-Project/ggthemr for theme options
+ggthemr(theme_choice, type = 'outer', layout = "scientific", spacing = 0.4)
+
+# Conduct analyses solely at the county level
+
+# If sewershed-restricted, case-based effective reproduction numbers are being included
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+  county_lag <- all_re_df %>% 
+    filter(location_level %notin% c("sewershed")) %>%
+    group_by(location_level, location) %>% 
+    do(ccf_analysis(., 
+                    models = c("EpiEstim", "Wallinga&Teunis"), 
+                    calcat_comparison = T,
+                    raw_cases_comparison = F,
+                    inputs_vec = c("raw_cases","root_transform")))}else{
+                      
+                      county_lag <- all_re_df %>% 
+                        filter(location_level %notin% c("sewershed")) %>%
+                        group_by(location_level, location) %>% 
+                        do(ccf_analysis(., 
+                                        models = c("EpiEstim", "Wallinga&Teunis"), 
+                                        calcat_comparison = T,
+                                        raw_cases_comparison = F,
+                                        inputs_vec = c("root_transform")))}
+                      
+# Conduct analyses for each individual sewershed, and merge resultant data frames into a single output data frame
+
+# Initialize output data frame
+sewershed_lag = data.frame(location=character(),
+                           location_level=character(),
+                           stationary_variable = character(),
+                           sliding_variable = character(),
+                           Re_model=character(),
+                           lag=numeric(), 
+                           acf=numeric()) 
+# Restrict data to sewershed level exclusively
+sewersheds_data = all_re_df %>% filter(location_level %in% c("sewershed"))
+
+# Conduct cross-correlation analyses for each sewershed
+
+# If sewershed-restricted, case-based effective reproduction numbers are being included
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+  for(w in unique(sewersheds_data$location)){
+    tryCatch({
+      data = sewersheds_data %>% filter(location == w)
+      temp_df = ccf_analysis(data, 
+                             models = c("EpiEstim", "Wallinga&Teunis"), 
+                             calcat_comparison = F,
+                             raw_cases_comparison = F,
+                             inputs_vec = c("raw_cases","root_transform"))
+      sewershed_lag <- sewershed_lag %>% bind_rows(temp_df)
+    }, error=function(e){cat("ERROR - ", w, " : ", conditionMessage(e), "\n")})
+  }} else{
+    for(w in unique(sewersheds_data$location)){
+      tryCatch({
+        data = sewersheds_data %>% filter(location == w)
+        temp_df = ccf_analysis(data, 
+                               models = c("EpiEstim", "Wallinga&Teunis"), 
+                               calcat_comparison = F,
+                               raw_cases_comparison = F,
+                               inputs_vec = c("root_transform")) 
+        sewershed_lag <- sewershed_lag %>% bind_rows(temp_df)
+      }, error=function(e){cat("ERROR - ", w, " : ", conditionMessage(e), "\n")})
+    }}
+
+# Merge county-level and sewershed-level results for cross-correlation analysis
+final_lag = county_lag %>% full_join(sewershed_lag) 
+
+# Join analyses results to data frame hosting all effective reproduction numbers
+final_lag = final_lag %>% 
+  left_join(all_re_df %>% 
+              group_by(location) %>% 
+              summarise(label_name = unique(label_name), County_address = unique(County_address))) %>%
+  mutate(County_address = ifelse(location_level == "county", location, County_address),
+         label_name = ifelse(location_level == "county", "COUNTY", label_name))
+```
+
+## 11.2: Restrict initial cross-correlation analyses results - report only the range of time lags for cross-correlation coefficients within 0.05 of the maximum observed correlation value in the original lag range of 20 days. Additionally, report only county-level results. 
+```{r}
+# Initialize output data frame with restricted analyses results
+max_lag = data.frame(location=character(),
+                     location_level=character(),
+                     label_name = character(),
+                     County_address=character(),
+                     stationary_variable = character(),
+                     sliding_variable = character(),
+                     Re_model=character(),
+                     lag_range=character(),
+                     maximum_acf_range=character(),
+                     lag=numeric(), 
+                     maximum_acf=numeric()) 
+
+# Use the below 'for' loop to create a data frame with restricted cross-correlation results
+
+# Sample loop input parameters for testing
+# loc = "Santa Clara"
+# model = "EpiEstim"
+# input1 = "CalCAT"
+# input2 = "root_transform"
+
+for(loc in unique(final_lag$location)){
+  data0 = final_lag %>% filter(location == loc)
+  for(model in unique(data0$Re_model)){ # Instantaneous or cohort
+    data1 = data0 %>% filter(Re_model == model)
+    for(input1 in unique(data1$stationary_variable)){ # Sewershed-restricted case-based or CalCAT ensemble-based effective reproduction numbers
+      data2 = data1 %>% filter(stationary_variable == input1)
+      for(input2 in unique(data2$sliding_variable)){ # Wastewater-based effective reproduction numbers
+        data3 = data2 %>% filter(sliding_variable == input2)
+        
+        max = max(data3$acf, na.rm = T) # Identify maximum cross-correlation coefficient
+        data_final = data3 %>% filter(abs(max - acf) <= .05) # Restrict to coefficients within .05 of maximum observed value
+        
+        # Format desired output data frame
+        max_lag_temp = data.frame(location=loc,
+                                  location_level=unique(data0$location_level),
+                                  label_name = unique(data0$label_name),
+                                  County_address= unique(data0$County_address),
+                                  stationary_variable = input1,
+                                  sliding_variable = input2,
+                                  Re_model=model,
+                                  lag_range= paste0("[", min(range(data_final$lag)), ",", max(range(data_final$lag)), "]"),
+                                  maximum_acf_range = paste0("[", round(min(range(data_final$acf)), 2), ",", round(max(range(data_final$acf)), 2), "]"),
+                                  lag= max(range(data_final$acf)), 
+                                  maximum_acf= max) 
+        # Merge with initialized output data frame
+        max_lag = max_lag %>% bind_rows(max_lag_temp)
+      }
+    }
+  }
+}
+
+# Restrict further by including only county-level results
+# If sewershed-restricted, case-based effective reproduction numbers are being included
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+  max_lag_restricted = max_lag %>% 
+    filter(sliding_variable %in% c("root_transform") & 
+             stationary_variable %in% c("raw_cases", "CalCAT")) %>%
+    filter(location_level == "county")}else{
+      max_lag_restricted = max_lag %>% 
+        filter(sliding_variable %in% c("root_transform") & 
+                 stationary_variable %in% c("CalCAT")) %>% 
+        filter(location_level == "county")
+    }
+
+# Create Table 6 of manuscript: the below code involves formatting/aesthetic fine-tuning of the table 
+
+max_lag_final = {}
+
+# If sewershed-restricted, case-based effective reproduction numbers are being included
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+  for(k in 1:length(unique(max_lag_restricted$County_address))){
+    l = unique(max_lag_restricted$County_address)[k]
+    DF1 = max_lag_table(max_lag_restricted, l, "raw_cases", "root_transform")
+    DF3 = max_lag_table(max_lag_restricted, l, "CalCAT", "root_transform")
+    
+    if(l == 1){
+      max_lag_final = bind_rows(DF1, DF3)
+    } else{
+      max_lag_final = max_lag_final %>% bind_rows(DF1, DF3)
+    }
+  }}else{
+    for(k in 1:length(unique(max_lag_restricted$County_address))){
+      l = unique(max_lag_restricted$County_address)[k]
+      DF3 = max_lag_table(max_lag_restricted, l, "CalCAT", "root_transform")
+      
+      if(l == 1){
+        max_lag_final = DF3
+      } else{
+        max_lag_final = max_lag_final %>% bind_rows(DF3)
+      }
+      
+    }}
+
+max_lag_allcounties = max_lag_final %>% rename(County = label_name,
+                                               `Stationary RC` = stationary_variable) %>% dplyr::select(-c(sliding_variable))
+
+# 'max_lag_allcounties' corresponds to Table 6
+View(max_lag_allcounties)
+
+# Save 'max_lag_allcounties'
+fwrite(max_lag_allcounties, paste0(table_path, 'Table 6.csv'))
+
+```
+
+## 11.3 [FIGURES S5 + S6] Create a 'geom_tile' plot mapping county-level cross-correlation coefficients for lag range of 20 days 
+
+```{r}
+final_lag_county_only = final_lag %>% 
+  filter(location_level == "county") %>% 
+  mutate(Re_model = ifelse(Re_model == "EpiEstim", "Instantaneous", ifelse(Re_model == "Wallinga&Teunis", "Cohort", Re_model)))
+
+# Create plot comparing wastewater- and sewershed-restricted case-based effective reproduction numbers (Figure S6)
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+  ccf_plot_all_counties_cases = ccf_plot_all_counties(stationary = "raw_cases", sliding = "root_transform")
+  
+  ccf_plot_all_counties_cases
+  # Save Figure
+  image_path <- glue::glue(paste0(fig_path, 'Figure S6.jpg'))
+  grDevices::jpeg(filename = image_path,
+                  width = 700,
+                  height = 1150
+  )
+  (ccf_plot_all_counties_cases)
+  dev.off()}
+
+# Create plot comparing wastewater- and CalCAT-based effective reproduction numbers  (Figure S5)
+ccf_plot_all_counties_calcat = ccf_plot_all_counties(stationary = "CalCAT", sliding = "root_transform")
+
+ccf_plot_all_counties_calcat
+# Save Figure
+image_path <- glue::glue(paste0(fig_path, 'Figure S5.jpg'))
+grDevices::jpeg(filename = image_path,
+                width = 700,
+                height = 1150
+)
+(ccf_plot_all_counties_calcat)
+dev.off()
+```
+
+# Step 12: Conduct confusion matrix analyses between wastewater- and CalCAT-based effective reproduction numbers
+
+## 12.1 [TABLES 4 + 5]: Report confusion matrix classification metrics
+```{r}
+# Create a 'category' variable within the data frame hosting all effective reproduction number estimates (necessary for confusion matrix classification downstream)
+all_re_df_confusionmatrix = all_re_df %>% 
+  mutate(category = ifelse(Re_estimate < 0.7, "<0.7",
+                           ifelse(Re_estimate >= 0.7 & Re_estimate < 0.9, "0.7-0.9", 
+                                  ifelse(Re_estimate >= 0.9 & Re_estimate < 1.1, "0.9-1.1", 
+                                         ifelse(Re_estimate >= 1.1 & Re_estimate < 1.3, "1.1-1.3", 
+                                                ifelse(Re_estimate > 1.3, ">1.3", NA))))))
+
+all_re_df_confusionmatrix = as.data.frame(all_re_df_confusionmatrix)
+
+# Calculate confusion matrix classification metrics for each county of interest independently using the below 'for' loop; merge results for all counties into a single data frame through the same 'for' loop
+unloadNamespace("tidyverse")
+library("caret")
+
+counties_of_interest = c("Santa Clara", "San Francisco", "Sacramento", "Stanislaus", "Yolo")
+for (j in 1:length(counties_of_interest)){
+  i = counties_of_interest[j]
+  df = confusionmatrix_metrics(all_re_df_confusionmatrix, 
+                               loc_level = "county", 
+                               loc = i, 
+                               actuals_model = "CalCAT ensemble", 
+                               preds_model_vector = c("EpiEstim","Wallinga&Teunis"), 
+                               preds_model_input = "root_transform")
+  
+  if(j == 1) {final_cm_metrics = df} else {final_cm_metrics = rbind(final_cm_metrics, df)}
+  
+}
+# Final output data frame of 'for' loop is 'final_cm_metrics' - this data frame contains all metrics reported within Tables 4 & 5 of the manuscript
+final_cm_metrics = final_cm_metrics %>% rename(County = location)
+
+# Save 'final_cm_metrics'
+fwrite(final_cm_metrics, paste0(table_path, 'Tables 4_and_5.csv'))
+
+
+```
+
+## 12.2: Produce 'geom_tile' plot outputting confusion matrix-based frequency of agreement between wastewater- and CalCAT-based effective reproduction numbers for the counties of interest
+
+### 12.2.1 [FIGURE 4] Create a 'geom_tile' plot for three counties highlighted within the main text
+```{r}
+# The below 'for' loop stores frequency of agreement for each county in independent data frames, and ultimately merges the data frames into a single output data frame
+counties_of_interest = c("Santa Clara", "San Francisco", "Yolo")
+for (j in 1:length(counties_of_interest)){
+  i = counties_of_interest[j]
+  df = confusionmatrix_as_df(all_re_df_confusionmatrix, 
+                             loc_level = "county", 
+                             loc = i, 
+                             actuals_model = "CalCAT ensemble", 
+                             preds_model_vector = c("EpiEstim","Wallinga&Teunis"), 
+                             preds_model_input = "root_transform")
+  
+  if(j == 1) {final_cm = df} else {final_cm = rbind(final_cm, df)}
+  
+}
+
+# The below code creates Figure 4
+library(tidyverse)
+nonWantedLevels<-c("<0.7", ">1.3") # Exclude two categories with no effective reproduction number values during the analysis period 
+
+# Further format 'final_cm' data frame in preparation for 'geom_tile' plot 
+final_cm = final_cm %>% 
+  mutate(Re_model = ifelse(Re_model == "EpiEstim", "Instantaneous", ifelse(Re_model == "Wallinga&Teunis", "Cohort", Re_model))) %>% 
+  filter(!as.character(Prediction) %in% nonWantedLevels, !as.character(Reference) %in% nonWantedLevels)
+
+# Create Figure 4
+gg <- ggplot(final_cm, aes(x=Reference, y=Prediction, fill=Freq))
+
+gg <- gg + geom_tile(color="white", linewidth=0.1) + 
+  xlab("Reference: CalCAT ensemble") + 
+  ylab(bquote(Prediction: R[ww])) + 
+  facet_grid(location ~ Re_model) + geom_text(aes(label = Freq), size = 5, color = "white")
+
+gg <- gg + scale_fill_gradientn(colours = colorspace::divergingx_hcl(palette = "Spectral", n = 10, rev = T)) +
+  theme(text=element_text(size=17))
+
+gg
+
+# Save Figure 4
+image_path <- glue::glue(paste0(fig_path, 'Figure 4.jpg'))
+grDevices::jpeg(filename = image_path,
+                width = 1000,
+                height = 733
+)
+(gg)
+dev.off()
+
+```
+
+### 12.2.2 [FIGURE S3] Create a 'geom_tile' plot for two counties highlighted within the supplemental text
+```{r}
+# The below repeats the exact process of Step 12.2.1, but for Stanislaus and Sacramento
+
+counties_of_interest = c("Stanislaus", "Sacramento")
+for (j in 1:length(counties_of_interest)){
+  i = counties_of_interest[j]
+  df = confusionmatrix_as_df(all_re_df_confusionmatrix, 
+                             loc_level = "county", 
+                             loc = i, 
+                             actuals_model = "CalCAT ensemble", 
+                             preds_model_vector = c("EpiEstim","Wallinga&Teunis"), 
+                             preds_model_input = "root_transform")
+  
+  if(j == 1) {final_cm = df} else {final_cm = rbind(final_cm, df)}
+  
+}
+
+nonWantedLevels<-c("<0.7", ">1.3")
+
+final_cm = final_cm %>% mutate(Re_model = ifelse(Re_model == "EpiEstim", "Instantaneous", ifelse(Re_model == "Wallinga&Teunis", "Cohort", Re_model))) %>% filter(!as.character(Prediction) %in% nonWantedLevels, !as.character(Reference) %in% nonWantedLevels)
+
+gg_supp <- ggplot(final_cm, aes(x=Reference, y=Prediction, fill=Freq))
+gg_supp <- gg_supp + geom_tile(color="white", linewidth=0.1) + 
+  xlab("Reference: CalCAT ensemble") + 
+  ylab(bquote(Prediction: R[ww])) + 
+  facet_grid(location ~ Re_model) + geom_text(aes(label = Freq), size = 5, color = "white")
+gg_supp <- gg_supp + scale_fill_gradientn(colours = colorspace::divergingx_hcl(palette = "Spectral", n = 10, rev = T)) +
+  theme(text=element_text(size=17))
+gg_supp
+
+# Save Figure S3
+image_path <- glue::glue(paste0(fig_path, 'Figure S3.jpg'))
+grDevices::jpeg(filename = image_path,
+                width = 650,
+                height = 450
+)
+(gg_supp)
+dev.off()
+```
+
+# Step 13 [TABLE 3]: Calculate mean absolute errors and Spearman’s rank correlations to compare wastewater- and case-based effective reproduction numbers. 
+
+## 13.1: County-level analysis (produces Table 3 of manuscript)
+```{r}
+county_comparison_analysis = data.frame(location=character(),
+                                           location_level=character(),
+                                           label_name = character(),
+                                           Re_model=character(),
+                                           actual_x_variable = character(),
+                                           predicted_y_variable = character(),
+                                           mae = numeric(),
+                                           spearman_rho=numeric(), 
+                                           spearman_pvalue=character()) 
+
+county_data = all_re_df %>% filter(location_level %notin% c("sewershed"))
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+  for(w in unique(county_data$County_address)){
+    
+    tryCatch({
+      
+      data = county_data %>% filter(County_address == w)
+      temp_df = compare_Re(data, 
+                           models = c("EpiEstim", "Wallinga&Teunis"), 
+                           inputs_vec = c("raw_cases", "root_transform"))
+      
+      county_comparison_analysis <- county_comparison_analysis %>% bind_rows(temp_df) %>% mutate(label_name = location)
+      
+    }, error=function(e){cat("ERROR - ", w, " : ", conditionMessage(e), "\n")})}} else{
+      
+      for(w in unique(county_data$County_address)){
+        
+        tryCatch({
+          
+          data = county_data %>% filter(County_address == w)
+          temp_df = compare_Re(data, 
+                               models = c("EpiEstim", "Wallinga&Teunis"), 
+                               inputs_vec = c("root_transform"))
+          
+          county_comparison_analysis <- county_comparison_analysis %>% bind_rows(temp_df) %>% mutate(label_name = location)
+          
+        }, error=function(e){cat("ERROR - ", w, " : ", conditionMessage(e), "\n")})}
+    }
+```
+
+## 13.2: Sewershed-level analysis (results not included within manuscript)
+```{r}
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+  # Initialize output data frame
+  sewershed_comparison_analysis = data.frame(location=character(),
+                                             location_level=character(),
+                                             label_name = character(),
+                                             Re_model=character(),
+                                             actual_x_variable = character(),
+                                             predicted_y_variable = character(),
+                                             mae = numeric(),
+                                             spearman_rho=numeric(), 
+                                             spearman_pvalue=character()) 
+  
+  # Restrict exclusively to sewershed-level data
+  sewersheds_data = all_re_df %>% filter(location_level %in% c("sewershed"))
+  
+  # Calculate metrics for each sewershed independently, then merge results for all sewersheds into a single data frame
+  for(w in unique(sewersheds_data$location)){
+    
+    tryCatch({
+      
+      data = sewersheds_data %>% filter(location == w)
+      if(unique(data$County_address) == "Yolo"){next} # Since sewershed-restricted raw cases in Yolo are aggregated due to low counts, cannot compare against sewershed-level wastewater-based effective reproduction numbers
+      
+      temp_df = compare_Re(data, 
+                           models = c("EpiEstim", "Wallinga&Teunis"), 
+                           calcat_comparison = F,
+                           raw_cases_comparison = T,
+                           inputs_vec = c("raw_cases", "root_transform"))
+      
+      sewershed_comparison_analysis <- sewershed_comparison_analysis %>% bind_rows(temp_df)
+      
+    }, error=function(e){cat("ERROR - ", w, " : ", conditionMessage(e), "\n")})
+    
+  }}
+```
+
+## 13.3: Merge county- and sewershed-level results 
+```{r}
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+  final_comparison = county_comparison_analysis %>% full_join(sewershed_comparison_analysis) 
+  final_comparison = final_comparison %>% left_join(all_re_df %>% group_by(location) %>% summarise(label_name = unique(label_name),County_address = unique(County_address))) %>%
+    mutate(County_address = ifelse(location_level == "county", location, County_address),
+           label_name = ifelse(location_level == "county", "COUNTY", label_name))}else{
+             final_comparison = county_comparison_analysis %>% 
+               left_join(all_re_df %>% group_by(location) %>% summarise(label_name = unique(label_name),
+                                                                        County_address = unique(County_address))) %>%
+               mutate(County_address = ifelse(location_level == "county", location, County_address),
+                      label_name = ifelse(location_level == "county", "COUNTY", label_name))}
+```
+
+## 13.4: Create data frame containing county-level results reported in Table 3 of the manuscript
+```{r}
+if(exists("r_effective_initial_cases") && is.data.frame(get("r_effective_initial_cases"))){
+# Table 3 exclusively contains county-level results
+final_comparison_restricted = final_comparison %>% filter(actual_x_variable %in% c("CalCAT", "raw_cases") & predicted_y_variable %in% c("root_transform"), location_level == "county") %>% ungroup() 
+
+# Format table/improve aesthetics of table
+comparison = {}
+
+for(k in 1:length(unique(final_comparison_restricted$County_address))){
+  l = unique(final_comparison_restricted$County_address)[k]
+  DF1 = comparison_table(final_comparison_restricted, l, "raw_cases", "root_transform")
+  DF3 = comparison_table(final_comparison_restricted, l, "CalCAT", "root_transform")
+  
+  if(l == 1){
+    comparison = bind_rows(DF1, DF3)
+  } else{
+    comparison = comparison %>% bind_rows(DF1, DF3)
+  }
+}
+comparison = comparison %>% dplyr::select(-c(predicted_y_variable)) %>% rename(County = label_name) 
+View(comparison)}else{
+  # Table 3 exclusively contains county-level results
+  final_comparison_restricted = final_comparison %>% filter(actual_x_variable %in% c("CalCAT") & predicted_y_variable %in% c("root_transform"), location_level == "county") %>% ungroup() 
+  
+  # Format table/improve aesthetics of table
+  comparison = {}
+  
+  for(k in 1:length(unique(final_comparison_restricted$County_address))){
+    l = unique(final_comparison_restricted$County_address)[k]
+    DF3 = comparison_table(final_comparison_restricted, l, "CalCAT", "root_transform")
+    
+    if(l == 1){
+      comparison = DF3
+    } else{
+      comparison = comparison %>% bind_rows(DF3)
+    }
+  }
+  comparison = comparison %>% dplyr::select(-c(predicted_y_variable)) %>% rename(County = label_name) 
+  View(comparison)
+}
+
+# Save final table, 'comparison' which corresponds to results reported in Table 3 of the manuscript
+fwrite(comparison, paste0(table_path, 'Table 3.csv'))
+```
+
